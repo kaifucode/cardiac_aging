@@ -1,0 +1,286 @@
+---
+title: "cardiac aging"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## run fastQC for general quality control   
+```{r eval=FALSE}
+fastqc -o /u/flashscratch/k/kaifu/AD10082018-98684083/fastq/fastqc_output  /u/flashscratch/k/kaifu/AD10082018-98684083/fastq/*.fastq.gz
+```
+
+trimming adaptor sequence
+
+> most RNA-Seq do not need this step, small RNA-Seq or ATAC-Seq will need this one
+
+run multiQC to merge fastQC results for all samples
+
+> see multiQC html file for the report
+
+## mapping raw reads back to genome using tophat
+```{r eval=FALSE}
+cat samples.txt | while read line;do qsub -cwd -e ${PWD}/${line}_LOGS -m bea -l highp,h_data=6G,h_rt=24:00:00 ./tophat.sh ${PWD}/${line/.fastq.gz/} ${PWD}/$line ${PWD}/${line/R1/R2}; done
+
+. /u/local/Modules/default/init/modules.sh
+module load tophat
+module load bowtie2
+tophat -p 4 --no-coverage-search -G ~/project-mcdb/datasets/Mus_musculus/UCSC/mm10/Annotation/Genes/genes.gtf -o $1 ~/project-mcdb/datasets/Mus_musculus/UCSC/mm10/Sequence/Bowtie2Index/genome $2 $3
+```
+> for all samples, the mappability is around or larger than 90%
+
+## calculating read counts for each gene
+```{r eval=FALSE}
+### sorting
+. /u/local/Modules/default/init/modules.sh
+module load samtools
+samtools sort -n $1/accepted_hits.bam $2
+
+cat samples.txt | while read line;do qsub -cwd -e ${PWD}/LOGS -m bea -l highp,h_data=8G,h_rt=4:00:00 ./bam_sort.sh ${line/.fastq.gz/} ${line/fastq.gz/sort}; done
+
+### merging
+. /u/local/Modules/default/init/modules.sh
+module load samtools
+samtools merge $1 $2 $3
+
+cat sub_samples.txt | while read line;do qsub -cwd -e ${PWD}/LOGS -m bea -l highp,h_data=8G,h_rt=4:00:00 ./bam_merge.sh ${line}.merge.bam ${line}.sort.bam ${line/L001/L002}.sort.bam; done
+
+### filtering duplicate reads which show abnormal loci enrichment
+### could use macs2 filterdup function to do this step
+
+### htseq counts
+qrsh -l highp,h_data=8G,h_rt=12:00:00 -pe shared 6
+
+genes=~/project-mcdb/datasets/Mus_musculus/UCSC/mm10/Annotation/Genes/genes.gtf
+cat merge_samples.txt | while read line;do 
+htseq-count -f bam -s no ${line} $genes > ${line}.htseq &
+done
+```
+
+## Sample: Read count in genes (alignment not unique)  
+Neo-1: 72M (38M)  
+Neo-2: 63M (39M)  
+Neo-3: 63M (33M)  
+4W-1: 75M (19M)  
+4W-2: 75M (19M)  
+4W-3: 74M (28M)  
+14W-1: 81M (26M)  
+14W-2: 62M (32M)  
+14M-3: 72M (42M)  
+1Y-1: 77M (33M)  
+1Y-2: 77M (36M)  
+1Y-3: 10M (21M)  
+18M-1: 41M (65M)  
+18M-2: 40M (66M)  
+18M-3: 23M (12M)  
+1YNew-1: 79M (26M)  
+1YNew-2: 64M (27M)  
+18MNew-1: 68M (25M)  
+18MNew-2: 69M (39M)  
+
+## Gene quantification: readcount2TPM
+```{r eval=FALSE}
+directory <- "/Users/kaifu/projects/cardiac_aging/whole_heart"
+setwd(directory)
+expMatrix <- read.table("raw_counts_whole_heart.txt",row.names = 1, header = TRUE, sep="\t")
+eff_length2 <-read.csv("/Users/kaifu/projects/visulization/FigureYa23count2TPMv2/mm10_eff_length.csv", row.names = 1, header = T)
+eff_length2$gene_id <- rownames(eff_length2)
+feature_ids <- rownames(expMatrix)
+expMatrix <- expMatrix[feature_ids %in% rownames(eff_length2),]
+mm <- match(rownames(expMatrix), rownames(eff_length2))
+eff_length2 <- eff_length2[mm, ]
+if (identical(rownames(eff_length2), rownames(expMatrix))){
+  print("GTF and expression matix now have the same gene and gene in same order")
+}
+x <- expMatrix / eff_length2$eff_length
+expMatrix_tpm <- t( t(x) / colSums(x) ) * 1e6 
+write.table(expMatrix_tpm, "output_count2tpm.txt", sep="\t", quote=F, row.names=T)
+```
+> Look for TPM.cvs files for the transcription per million gene expression values for each gene for all samples
+
+
+## Establish, pre-filtering and normalization of gene read count matrix
+```{r echo=FALSE, message=FALSE}
+library("DESeq2")
+library("pheatmap")
+directory <- "/Users/kaifu/projects/cardiac_aging/new"
+sampleFiles <- grep("htseq", list.files(directory), value = TRUE)
+# set up samplecondition manually
+sampleCondition <- sub("-[123]_S.*htseq","",sampleFiles)
+sampleTable <- data.frame(sampleName = sampleFiles,fileName = sampleFiles,
+condition = sampleCondition)
+dds <- DESeqDataSetFromHTSeqCount(sampleTable = sampleTable, directory = directory, design= ~ condition)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+rld <- rlogTransformation(dds)
+```
+
+## Relationship among samples
+1. clustering of sample distances  
+```{r echo=FALSE}
+sampleDists <- dist(t(assay(rld)))
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- rld$condition
+colnames(sampleDistMatrix) <- rld$condition
+colors <- colorRampPalette( brewer.pal(9,"Blues"))(255)
+pheatmap(sampleDistMatrix, clustering_distance_rows = sampleDists, clustering_distance_cols = sampleDists, cluster_rows = TRUE, cluster_cols = TRUE, col = colors)
+```
+
+2. clustering of sample correlations  
+```{r echo=FALSE}
+library(corrplot)
+M <- cor(assay(rld))
+#M <- (M-mean(as.vector(M)))/sd(as.vector(M))
+rownames(M) <- rld$condition
+colnames(M) <- rld$condition
+pheatmap(M, cluster_rows = TRUE, cluster_cols = TRUE )
+```
+
+3. principle component analysis of samples  
+```{r echo=FALSE}
+plotPCA(rld, intgroup="condition")
+```
+
+## K-means clustering of all genes for all samples  
+```{r echo=FALSE}
+mean <- assay(rld)-rowMeans(assay(rld))
+colnames(mean) <- rld$condition
+mean[mean>4] <-4
+mean[mean<-4] <-4
+x<-pheatmap(mean,cluster_cols=FALSE,kmeans_k=6)
+output <- data.frame(assay(rld)-rowMeans(assay(rld)),x$kmeans$cluster)
+cluster1 <- rownames(output[output[,11]==1,])
+cluster2 <- rownames(output[output[,11]==2,])
+cluster3 <- rownames(output[output[,11]==3,])
+cluster4 <- rownames(output[output[,11]==4,])
+cluster5 <- rownames(output[output[,11]==5,])
+cluster6 <- rownames(output[output[,11]==6,])
+
+write.table(cluster1,file='cluster1_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE,sep="\t")
+write.table(cluster2,file='cluster2_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE,sep="\t")
+write.table(cluster3,file='cluster3_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE, sep="\n")
+write.table(cluster4,file='cluster4_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE,sep="\t")
+write.table(cluster5,file='cluster5_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE,sep="\t")
+write.table(cluster6,file='cluster6_genes.txt',quote=FALSE,row.names = FALSE,col.names = FALSE, sep="\n")
+```
+
+## Plot specific gene expression values for interested genes
+```{r echo=FALSE}
+library(gplots)
+library(RColorBrewer)
+plotCounts(dds, gene='Sfrp1', intgroup = "condition")
+plotCounts(dds, gene='Vim', intgroup = "condition")
+plotCounts(dds, gene='Pdgfra', intgroup = "condition")
+
+# wnt genes
+genes <- c("Wnt1","Wnt10b","Wnt11","Wnt16","Wnt2","Wnt2b","Wnt4","Wnt5a","Wnt5b","Wnt6","Wnt8b","Wnt9a","Wnt9b")
+
+# inflammation genes
+genes <- c("Chrna7", "Duoxa1", "Bst1", "Pglyrp1", "Wfdc1", "Slamf8", "Apod", "Serpinf1", "Setd6", "Socs3", "Calcrl", "Cd55", "Gpr17", "Slc7a2", "Cd200", "Tnfaip6" , "Metrnl", "Usp18")
+
+# matrix organization genes
+genes <- c("Col8a1", "Postn", "Col24a1", "Col5a2", "Col1a1", "Lox", "Mmp11", "Col4a2", "Col1a2", "Col3a1","Bmp8a")
+
+# hippo pathway genes
+genes <- c("Dchs1", "Fat1", "Fat2", "Fat3", "Fat4", "Frmd6", "Wwc1", "Nf2", "Lats1", "Lats2", "Yap1", "Taz", "Tead1", "Tead2", "Tead3", "Tead4")
+
+genes <- assay(rld[match(genes,rownames(assay(rld))),])
+colnames(genes) <- rld$condition
+color_heatmap <- colorRampPalette(rev(brewer.pal(n = 7, name ="RdYlBu")))(100)
+pheatmap((genes - rowMeans(genes)),cluster_rows = FALSE, cluster_cols = FALSE, color = color_heatmap, breaks = seq(-3,3,length.out = 101) )
+
+```
+
+## Differential expressed genes analysis and gene ontology enrichment analysis
+```{r echo=FALSE, out.width = "80%", eval=FALSE}
+
+dds <- DESeq(dds)
+# NOTING: if lfcThreshold is specific, the alpha, e.g. padj value will be overdrawn
+# ADD COMPARED CONDITION IN THE FOLLOWING TWO LINES
+condition1 <- c("Neo","4W","1YNew","Neo")
+condition2 <- c("4W","14W","18MNew","18MNew")
+
+library("org.Mm.eg.db")
+library("clusterProfiler")
+
+for (i in 1:length(condition1)) {
+  res <- results(dds, alpha = 0.05, contrast=c("condition",condition1[i],condition2[i]))
+  plotMA(res, main=paste(condition1[i], condition2[i], sep = "_VS_"))
+  res <- res[order(res$padj), ]
+  ## add Ensembl and Entrez ID
+  res$ensembl <- mapIds(org.Mm.eg.db,
+                     keys=row.names(res),
+                     column="ENSEMBL",
+                     keytype="SYMBOL",
+                     multiVals="first")
+  res$entrez <- mapIds(org.Mm.eg.db,
+                     keys=row.names(res),
+                     column="ENTREZID",
+                     keytype="SYMBOL",
+                     multiVals="first")
+  ## filter by padj value
+  diff_gene_deseq2 <- subset(res,padj < 0.05)
+  ## further filter by log2fold change: up-regulated genes
+  up_regulated <- subset(diff_gene_deseq2, log2FoldChange >= 1)
+  output_file_name <- paste(condition1[i], condition2[i], sep = ">")
+  write.table(as.data.frame(up_regulated), sep = "\t", quote=FALSE, file=paste(output_file_name,".txt", sep = ""))
+  # clusterProfiler analysis for up-regulated genes
+  ## gene ontology enrichment
+  gene <- up_regulated[,"entrez"]
+  ego <- enrichGO(gene = gene, keyType = "ENTREZID", OrgDb = org.Mm.eg.db,
+                ont = "BP", pAdjustMethod = "BH", pvalueCutoff  = 0.01,
+                qvalueCutoff  = 0.05, readable = TRUE)
+  cat("GO analysis for genes up-regulated in", condition1[i], "\n")
+  cat("dotplot\n")
+  plot(dotplot(ego))
+  cat("emapplot\n")
+  plot(emapplot(ego))
+  geneList <- res[,"log2FoldChange"]
+  names(geneList) <- res[,"entrez"]
+  geneList <- sort(geneList, decreasing = TRUE)
+  cat("cnetplot\n")
+  plot(cnetplot(ego, categorySize="pvalue", foldChange=geneList))
+  ## kegg pathway enrichment
+  ekegg <- enrichKEGG(gene = gene, organism = 'mmu', pvalueCutoff = 0.05)
+  cat("KEGG pathway analysis for genes up-regulated in", condition1[i], "\n")
+  cat("dotplot\n")
+  plot(dotplot(ekegg))
+  cat("emapplot\n")
+  plot(emapplot(ekegg))
+  cat("cnetplot\n")
+  plot(cnetplot(ekegg, categorySize="pvalue", foldChange=geneList))
+
+  ## further filter by log2fold change: down-regulated genes  
+  down_regulated <- subset(diff_gene_deseq2, log2FoldChange <= -1)
+  output_file_name <- paste(condition1[i], condition2[i], sep = "<")
+  write.table(as.data.frame(down_regulated), sep = "\t", quote=FALSE, file=paste(output_file_name,".txt", sep = ""))
+  # clusterProfiler analysis for down-regulated genes
+  ## gene ontology enrichment
+  gene <- down_regulated[,"entrez"]
+  ego <- enrichGO(gene = gene, keyType = "ENTREZID", OrgDb = org.Mm.eg.db,
+                ont = "BP", pAdjustMethod = "BH", pvalueCutoff  = 0.01,
+                qvalueCutoff  = 0.05, readable = TRUE)
+  cat("GO analysis for genes up-regulated in", condition2[i], "\n")
+  cat("dotplot\n")
+  plot(dotplot(ego))
+  cat("emapplot\n")
+  plot(emapplot(ego))
+  cat("cnetplot\n")
+  plot(cnetplot(ego, categorySize="pvalue", foldChange=geneList))
+  ## kegg pathway enrichment
+  ekegg <- enrichKEGG(gene = gene, organism = 'mmu', pvalueCutoff = 0.05)
+  cat("KEGG analysis for genes up-regulated in", condition2[i], "\n")
+  cat("dotplot\n")
+  plot(dotplot(ekegg))
+  cat("emapplot\n")
+  plot(emapplot(ekegg))
+  cat("cnetplot\n")
+  plot(cnetplot(ekegg, categorySize="pvalue", foldChange=geneList))
+}
+
+```
+
